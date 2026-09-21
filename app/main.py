@@ -19,6 +19,14 @@ class EvaluateRequest(BaseModel):
     target: Any
 
 
+class CompareRequest(BaseModel):
+    baseline_facts: Dict[str, Any] = Field(default_factory=dict)
+    candidate_facts: Dict[str, Any] = Field(default_factory=dict)
+    rules: Optional[Dict[str, Any]] = None
+    # Same inline-node-or-name semantics as EvaluateRequest.target.
+    target: Any
+
+
 app = FastAPI(
     title="Compliance Rule Evaluation API",
     version="1.0.0",
@@ -64,3 +72,20 @@ def evaluate(req: EvaluateRequest) -> Dict[str, Any]:
     engine.analyze(req.rules, req.target)
     # Stage 2: three-valued evaluation with diagnostics.
     return engine.evaluate(req.rules, req.facts, req.target)
+
+
+@app.post("/compare")
+def compare(req: CompareRequest) -> Dict[str, Any]:
+    """Evaluate one rules/target pair against two fact sets and diff them."""
+    # Static checks run once for the shared rules/target: malformed nodes,
+    # missing refs and cycles reject the whole request before any evaluation.
+    engine.analyze(req.rules, req.target)
+    # Each side keeps its own short-circuit traversal, diagnostics and order.
+    baseline = engine.evaluate(req.rules, req.baseline_facts, req.target)
+    candidate = engine.evaluate(req.rules, req.candidate_facts, req.target)
+    return {
+        "baseline": baseline,
+        "candidate": candidate,
+        "result_changed": baseline["result"] != candidate["result"],
+        "diff": engine.diff_evaluations(baseline, candidate),
+    }

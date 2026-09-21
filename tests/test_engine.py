@@ -288,3 +288,121 @@ def test_unknown_extra_key_rejected():
 def test_rules_must_be_object():
     with pytest.raises(engine.RuleError, match="'rules'"):
         engine.analyze([], {"eq": ["x", 1]})
+
+
+# --------------------------------------------------------------------------- #
+# Evaluation diffing (POST /compare)
+# --------------------------------------------------------------------------- #
+
+
+def _compare_run(rules, target, baseline_facts, candidate_facts):
+    engine.analyze(rules, target)
+    baseline = engine.evaluate(rules, baseline_facts, target)
+    candidate = engine.evaluate(rules, candidate_facts, target)
+    return baseline, candidate, engine.diff_evaluations(baseline, candidate)
+
+
+def test_diff_classifies_added_removed_and_result_changed():
+    # Outer 'all' stays non-false on both sides, while the two subtrees move
+    # their short-circuit boundaries in opposite directions:
+    #   subtree 0 (any) expands on the candidate -> a new path
+    #   subtree 1 (all) contracts on the candidate -> a removed path
+    target = {"all": [
+        {"any": [{"eq": ["a", 1]}, {"eq": ["x", 9]}]},
+        {"all": [{"eq": ["c", 1]}, {"eq": ["d", 2]}]},
+    ]}
+    # Baseline: a=1 short-circuits the inner any (x unread); c=1 then d is
+    # missing (unknown, still traversed) -> outer result unknown.
+    # Candidate: a=0,x=9 reaches any[1]; c=0 short-circuits the inner all
+    # (d unread) -> outer result false.
+    baseline, candidate, diff = _compare_run(
+        {}, target, {"a": 1, "c": 1}, {"a": 0, "x": 9, "c": 0}
+    )
+    assert baseline["result"] == "unknown"
+    assert candidate["result"] == "false"
+
+    added = diff["added"]
+    assert [e["path"] for e in added] == ["$target/all[0]/any[1]"]
+    assert added[0]["field"] == "x"
+    assert added[0]["expected"] == 9
+    assert added[0]["result"] == "true"
+
+    removed = diff["removed"]
+    assert [e["path"] for e in removed] == ["$target/all[1]/all[1]"]
+    assert removed[0]["field"] == "d"
+    assert removed[0]["expected"] == 2
+    assert removed[0]["result"] == "unknown"
+
+    assert [c["path"] for c in diff["result_changed"]] == [
+        "$target/all[0]/any[0]",
+        "$target/all[1]/all[0]",
+        "$target/all[1]",
+        "$target",
+    ]
+    leaf = diff["result_changed"][0]
+    assert leaf["baseline_result"] == "true"
+    assert leaf["candidate_result"] == "false"
+    assert leaf["field"] == "a"
+
+    assert diff["used_facts"] == {"added": ["x"], "removed": ["d"]}
+    assert diff["missing_fields"] == {"added": [], "removed": ["d"]}
+
+
+def test_diff_short_circuit_boundary_expansion_adds_paths():
+    # Baseline: first child false -> all[1] is skipped.
+    # Candidate: first child true -> second child is traversed.
+    target = {"all": [{"eq": ["a", 1]}, {"eq": ["b", 2]}]}
+    _, _, diff = _compare_run({}, target, {"a": 0, "b": 2}, {"a": 1, "b": 2})
+
+    added = diff["added"]
+    assert [e["path"] for e in added] == ["$target/all[1]"]
+    assert added[0]["field"] == "b"
+    assert added[0]["expected"] == 2
+    assert added[0]["result"] == "true"
+    assert diff["removed"] == []
+
+    # The first leaf flipped false -> true and the parent followed.
+    changed_paths = [c["path"] for c in diff["result_changed"]]
+    assert changed_paths == ["$target/all[0]", "$target"]
+    leaf_change = next(c for c in diff["result_changed"] if c["path"] == "$target/all[0]")
+    assert leaf_change["baseline_result"] == "false"
+    assert leaf_change["candidate_result"] == "true"
+    assert leaf_change["field"] == "a"
+
+
+def test_diff_identical_evaluations_have_no_changes():
+    target = {"any": [{"eq": ["a", 1]}, {"eq": ["b", 2]}]}
+    facts = {"a": 1}
+    baseline, candidate, diff = _compare_run({}, target, facts, dict(facts))
+    assert baseline == candidate
+    assert diff["added"] == []
+    assert diff["removed"] == []
+    assert diff["result_changed"] == []
+    assert diff["used_facts"] == {"added": [], "removed": []}
+    assert diff["missing_fields"] == {"added": [], "removed": []}
+
+
+def test_diff_missing_fields_move_both_directions():
+    target = {"all": [{"eq": ["a", 1]}, {"eq": ["b", 2]}]}
+    # Both fields are referenced on both sides (unknown does not short-circuit),
+    # so only the missing-field membership swaps sides.
+    _, _, diff = _compare_run({}, target, {"a": 1}, {"b": 2})
+    assert diff["used_facts"] == {"added": [], "removed": []}
+    assert diff["missing_fields"] == {"added": ["a"], "removed": ["b"]}
+
+
+def test_diff_result_changed_follows_baseline_traversal_order():
+    # Two leaves flip unknown -> true (never false, so 'all' traverses every
+    # child on both sides); entries must stay in baseline traversal order.
+    target = {"all": [{"eq": ["z", 1]}, {"eq": ["a", 2]}, {"eq": ["m", 3]}]}
+    _, _, diff = _compare_run(
+        {},
+        target,
+        {"m": 3},
+        {"z": 1, "a": 2, "m": 3},
+    )
+    assert [c["path"] for c in diff["result_changed"]] == [
+        "$target/all[0]",
+        "$target/all[1]",
+        "$target",
+    ]

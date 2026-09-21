@@ -23,6 +23,8 @@ Evaluation happens in two stages:
 2. :func:`evaluate` evaluates the target rule while recording the rule paths
    actually traversed (short-circuit included), the facts actually read and
    the fact fields that were referenced but not provided.
+3. :func:`diff_evaluations` aligns two evaluations of the same rule tree by
+   path, powering the ``/compare`` endpoint.
 """
 
 from __future__ import annotations
@@ -414,3 +416,87 @@ def _eval_node(
         ref=ref,
     )
     return val
+
+
+# --------------------------------------------------------------------------- #
+# Comparing two evaluations of the same rule tree (used by POST /compare)
+# --------------------------------------------------------------------------- #
+
+
+def _entry_index(hit_paths: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Index hit-path entries by their unique path."""
+    return {entry["path"]: entry for entry in hit_paths}
+
+
+def _set_diff(baseline: list[str], candidate: list[str]) -> dict[str, list[str]]:
+    """Added/removed members between two already-sorted lists."""
+    base, cand = set(baseline), set(candidate)
+    return {
+        "added": sorted(cand - base),
+        "removed": sorted(base - cand),
+    }
+
+
+def diff_evaluations(
+    baseline: dict[str, Any], candidate: dict[str, Any]
+) -> dict[str, Any]:
+    """Align two evaluations of the same rules/target and report the delta.
+
+    ``baseline`` and ``candidate`` are outputs of :func:`evaluate` run against
+    different facts. Paths are aligned 1:1 because the rule tree is identical;
+    short-circuiting can still make a path appear on only one side.
+
+    Returned keys:
+
+    * ``added``   : full hit-path entries traversed only on the candidate side
+    * ``removed`` : full hit-path entries traversed only on the baseline side
+    * ``result_changed`` : entries present on both sides whose three-valued
+      ``result`` differs
+    * ``used_facts`` / ``missing_fields`` : ``{"added": [...], "removed": [...]}``
+
+    All lists are stable: ``added`` follows the candidate traversal order,
+    ``removed`` and ``result_changed`` follow the baseline traversal order, and
+    set diffs are sorted lexicographically (the evaluation outputs already are).
+    """
+    base_by_path = _entry_index(baseline["hit_paths"])
+    cand_by_path = _entry_index(candidate["hit_paths"])
+
+    # Preserve traversal order on the originating side instead of sorting paths
+    # lexically, so output stays tied to deterministic evaluation order.
+    added = [
+        entry for entry in candidate["hit_paths"]
+        if entry["path"] not in base_by_path
+    ]
+    removed = [
+        entry for entry in baseline["hit_paths"]
+        if entry["path"] not in cand_by_path
+    ]
+
+    result_changed: list[dict[str, Any]] = []
+    for entry in baseline["hit_paths"]:
+        other = cand_by_path.get(entry["path"])
+        if other is not None and other["result"] != entry["result"]:
+            change = {
+                "path": entry["path"],
+                "kind": entry["kind"],
+                "baseline_result": entry["result"],
+                "candidate_result": other["result"],
+            }
+            # Static metadata (field/expected/ref) is identical on both sides
+            # because the rule tree is shared; carry it for readability.
+            if "field" in entry:
+                change["field"] = entry["field"]
+                change["expected"] = entry["expected"]
+            if "ref" in entry:
+                change["ref"] = entry["ref"]
+            result_changed.append(change)
+
+    return {
+        "added": added,
+        "removed": removed,
+        "result_changed": result_changed,
+        "used_facts": _set_diff(baseline["used_facts"], candidate["used_facts"]),
+        "missing_fields": _set_diff(
+            baseline["missing_fields"], candidate["missing_fields"]
+        ),
+    }
