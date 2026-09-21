@@ -5,6 +5,7 @@
 - 规则节点仅支持 `all`、`any`、`not`、`ref` 以及 `eq / ne / gt / gte / lt / lte` 事实比较
 - 求值前先解析全部引用依赖：**缺失引用**与**循环引用**直接拒绝（422）
 - 求值采用 Kleene 三值逻辑，支持短路；即使短路，也会返回**实际读取的事实、未提供字段、命中的规则路径**
+- `POST /compare` 用同一份 rules/target 对 **baseline / candidate 两份事实**分别求值，并给出按路径对齐的差异
 - 同一请求输出稳定：数组型规则按给定顺序求值，集合类结果排序，路径确定
 - 依赖安装与初始化全部在镜像构建阶段完成，单条命令启动；**不依赖任何外部账号或付费服务**
 
@@ -18,7 +19,7 @@ docker compose up --build
 
 启动后服务监听 **8000** 端口：
 
-- 接口地址：`POST http://localhost:8000/evaluate`
+- 接口地址：`POST http://localhost:8000/evaluate`（单次求值）、`POST http://localhost:8000/compare`（双事实对比）
 - 健康检查：`GET http://localhost:8000/health`
 - 交互式文档：`http://localhost:8000/docs`（Swagger UI）
 
@@ -98,6 +99,73 @@ curl -s -X POST http://localhost:8000/evaluate \
 - `invalid_request`：请求体不满足 schema（由 Pydantic/FastAPI 给出明细）
 
 任何规则静态错误都在求值**之前**返回，服务不会带着坏规则执行。
+
+### 对比接口 `POST /compare`
+
+用**同一份** `rules` / `target` 对两份事实字典分别求值，再输出两侧差异。规则静态校验只执行一次，两次求值的短路、引用解析与稳定排序语义与 `/evaluate` 完全一致。
+
+请求体：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `baseline_facts` | object | 否（默认 `{}`） | 基线事实字典 |
+| `candidate_facts` | object | 否（默认 `{}`） | 候选事实字典 |
+| `rules` | object | 否 | 命名规则映射（两侧共用） |
+| `target` | object 或 string | 是 | 内联规则节点或规则名（两侧共用） |
+
+响应体（HTTP 200）：
+
+| 字段 | 说明 |
+|---|---|
+| `baseline` / `candidate` | 两侧各自的完整求值结果，结构同 `/evaluate` 响应 |
+| `result_changed` | 两侧 `result` 三值标签是否不同 |
+| `hit_paths_added` | 仅候选侧命中的路径记录（按候选侧遍历顺序） |
+| `hit_paths_removed` | 仅基线侧命中的路径记录（按基线侧遍历顺序） |
+| `hit_paths_result_changed` | 两侧都命中但结果不同的路径记录 |
+| `used_facts_added` / `used_facts_removed` | 实际读取事实字段的增/减（字典序） |
+| `missing_fields_added` / `missing_fields_removed` | 缺失字段的增/减（字典序） |
+
+`hit_paths` 按 `path` 对齐：同一 rules/target 下，同一路径在两侧对应同一规则节点，因此只有 `result` 可能不同。`hit_paths_result_changed` 中每条记录保留公共元数据（`path`、`kind`，及比较节点的 `field`/`expected`、命名规则体内的 `ref`），并以 `baseline_result` / `candidate_result` 标注两侧结果。路径集合的差异只会来自短路：一侧被短路跳过的子树，在另一侧可能实际被遍历（新增），反之亦然（移除）。
+
+示例：
+
+```bash
+curl -s -X POST http://localhost:8000/compare \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "baseline_facts":  {"age": 17, "country": "CN"},
+    "candidate_facts": {"age": 20},
+    "rules": {
+      "is_adult": {"gte": ["age", 18]},
+      "eligible": {"all": [{"ref": "is_adult"}, {"eq": ["country", "CN"]}]}
+    },
+    "target": "eligible"
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "baseline":  {"result": "false",   "result_known": true,  "used_facts": ["age"], "missing_fields": [], "hit_paths": ["..."]},
+  "candidate": {"result": "unknown", "result_known": false, "used_facts": ["age", "country"], "missing_fields": ["country"], "hit_paths": ["..."]},
+  "result_changed": true,
+  "hit_paths_added": [
+    {"path": "$target/all[1]", "kind": "compare", "result": "unknown", "field": "country", "expected": "CN"}
+  ],
+  "hit_paths_removed": [],
+  "hit_paths_result_changed": [
+    {"path": "$target/all[0]/ref:is_adult", "kind": "compare", "field": "age", "expected": 18, "ref": "is_adult", "baseline_result": "false", "candidate_result": "true"},
+    {"path": "$target", "kind": "all", "ref": "eligible", "baseline_result": "false", "candidate_result": "unknown"}
+  ],
+  "used_facts_added": ["country"],
+  "used_facts_removed": [],
+  "missing_fields_added": ["country"],
+  "missing_fields_removed": []
+}
+```
+
+错误响应与 `/evaluate` 相同：规则静态错误（`rule_error`）与请求体不合法（`invalid_request`）均返回 422，且在任何求值发生之前返回。
 
 ---
 
@@ -187,6 +255,8 @@ curl -s -X POST http://localhost:8000/evaluate \
 
 循环检测覆盖整个 `rules` 图（含当前 target 不可达的规则），尽早暴露坏配置。
 
+`/compare` 复用同一流程：第 1–3 步对共享的 rules/target 执行一次，第 4 步对 `baseline_facts` 与 `candidate_facts` 各执行一次，最后按路径对齐输出差异。
+
 ---
 
 ## 6. 本地开发（不使用 Docker）
@@ -202,7 +272,7 @@ uvicorn app.main:app --reload --port 8000   # 启动
 pytest -q                                    # 运行测试
 ```
 
-测试覆盖：六个比较符、Kleene 真值表、短路诊断、缺失引用/自环/直接环/间接环、DAG 菱形复用、结构非法节点、端到端 HTTP 行为（共 46 个用例）。
+测试覆盖：六个比较符、Kleene 真值表、短路诊断、缺失引用/自环/直接环/间接环、DAG 菱形复用、结构非法节点、baseline/candidate 对比差异、端到端 HTTP 行为（共 59 个用例）。
 
 ---
 

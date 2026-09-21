@@ -288,3 +288,107 @@ def test_unknown_extra_key_rejected():
 def test_rules_must_be_object():
     with pytest.raises(engine.RuleError, match="'rules'"):
         engine.analyze([], {"eq": ["x", 1]})
+
+
+# --------------------------------------------------------------------------- #
+# Baseline vs candidate comparison
+# --------------------------------------------------------------------------- #
+
+
+def test_compare_identical_facts_has_empty_diff():
+    rules = {"eligible": {"all": [
+        {"gte": ["age", 18]},
+        {"eq": ["country", "CN"]},
+    ]}}
+    facts = {"age": 20, "country": "CN"}
+    engine.analyze(rules, "eligible")
+    out = engine.compare(rules, facts, dict(facts), "eligible")
+    assert out["result_changed"] is False
+    assert out["baseline"]["result"] == out["candidate"]["result"] == "true"
+    assert out["baseline"]["hit_paths"] == out["candidate"]["hit_paths"]
+    assert out["hit_paths_added"] == []
+    assert out["hit_paths_removed"] == []
+    assert out["hit_paths_result_changed"] == []
+    assert out["used_facts_added"] == []
+    assert out["used_facts_removed"] == []
+    assert out["missing_fields_added"] == []
+    assert out["missing_fields_removed"] == []
+
+
+def test_compare_reports_result_changes_per_path():
+    target = {"all": [{"gte": ["age", 18]}, {"eq": ["country", "CN"]}]}
+    engine.analyze({}, target)
+    out = engine.compare(
+        {}, {"age": 20, "country": "US"}, {"age": 20, "country": "CN"}, target
+    )
+    assert out["result_changed"] is True
+    assert out["baseline"]["result"] == "false"
+    assert out["candidate"]["result"] == "true"
+    changed = {e["path"]: e for e in out["hit_paths_result_changed"]}
+    # The flipped leaf and the root are reported; the unchanged leaf is not.
+    assert set(changed) == {"$target/all[1]", "$target"}
+    leaf = changed["$target/all[1]"]
+    assert leaf["baseline_result"] == "false"
+    assert leaf["candidate_result"] == "true"
+    assert leaf["field"] == "country"
+    assert leaf["expected"] == "CN"
+    assert changed["$target"]["baseline_result"] == "false"
+    assert changed["$target"]["candidate_result"] == "true"
+
+
+def test_compare_short_circuit_adds_and_removes_paths():
+    target = {"all": [{"eq": ["a", 1]}, {"eq": ["b", 2]}]}
+    engine.analyze({}, target)
+    # Baseline short-circuits on all[0]; candidate traverses all[1] as well.
+    out = engine.compare({}, {"a": 0, "b": 2}, {"a": 1, "b": 2}, target)
+    assert [e["path"] for e in out["hit_paths_added"]] == ["$target/all[1]"]
+    assert out["hit_paths_removed"] == []
+    # The reverse direction removes the path instead.
+    back = engine.compare({}, {"a": 1, "b": 2}, {"a": 0, "b": 2}, target)
+    assert [e["path"] for e in back["hit_paths_removed"]] == ["$target/all[1]"]
+    assert back["hit_paths_added"] == []
+
+
+def test_compare_used_and_missing_diffs_are_sorted():
+    target = {"all": [{"eq": ["a", 1]}, {"eq": ["b", 2]}, {"eq": ["c", 3]}]}
+    engine.analyze({}, target)
+    # Baseline reads only "a" (short-circuit); candidate reads a, b, c and
+    # finds b and c missing.
+    out = engine.compare({}, {"a": 0, "b": 2, "c": 3}, {"a": 1}, target)
+    assert out["used_facts_added"] == ["b", "c"]
+    assert out["used_facts_removed"] == []
+    assert out["missing_fields_added"] == ["b", "c"]
+    assert out["missing_fields_removed"] == []
+    back = engine.compare({}, {"a": 1}, {"a": 0, "b": 2, "c": 3}, target)
+    assert back["used_facts_removed"] == ["b", "c"]
+    assert back["missing_fields_removed"] == ["b", "c"]
+
+
+def test_compare_respects_refs_on_both_sides():
+    rules = {
+        "is_adult": {"gte": ["age", 18]},
+        "eligible": {"all": [{"ref": "is_adult"}, {"eq": ["country", "CN"]}]},
+    }
+    engine.analyze(rules, "eligible")
+    out = engine.compare(
+        rules,
+        {"age": 17, "country": "CN"},
+        {"age": 18, "country": "CN"},
+        "eligible",
+    )
+    assert out["result_changed"] is True
+    changed = {e["path"]: e for e in out["hit_paths_result_changed"]}
+    leaf = changed["$target/all[0]/ref:is_adult"]
+    assert leaf["ref"] == "is_adult"
+    assert leaf["baseline_result"] == "false"
+    assert leaf["candidate_result"] == "true"
+    # country was only reached on the candidate side (baseline short-circuited)
+    assert [e["path"] for e in out["hit_paths_added"]] == ["$target/all[1]"]
+
+
+def test_compare_output_is_deterministic():
+    rules = {"r": {"any": [{"eq": ["x", 1]}, {"eq": ["y", 2]}, {"eq": ["z", 3]}]}}
+    engine.analyze(rules, "r")
+    first = engine.compare(rules, {"x": 0}, {"z": 3}, "r")
+    second = engine.compare(rules, {"x": 0}, {"z": 3}, "r")
+    assert first == second

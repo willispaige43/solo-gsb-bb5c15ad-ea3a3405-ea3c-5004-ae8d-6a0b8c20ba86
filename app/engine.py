@@ -23,6 +23,9 @@ Evaluation happens in two stages:
 2. :func:`evaluate` evaluates the target rule while recording the rule paths
    actually traversed (short-circuit included), the facts actually read and
    the fact fields that were referenced but not provided.
+
+:func:`compare` runs stage 2 twice (baseline vs candidate facts) over one
+statically-checked rules/target pair and diffs the two outcomes.
 """
 
 from __future__ import annotations
@@ -414,3 +417,72 @@ def _eval_node(
         ref=ref,
     )
     return val
+
+
+# --------------------------------------------------------------------------- #
+# Baseline vs candidate comparison
+# --------------------------------------------------------------------------- #
+
+
+def _result_change(
+    baseline_entry: dict[str, Any], candidate_entry: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge two entries that share a path, keeping both three-valued results.
+
+    Same rules + same target means the node at a given path is identical on
+    both sides, so only ``result`` can differ; the remaining metadata
+    (``kind``, ``field``, ``expected``, ``ref``) is taken from the baseline.
+    """
+    record = {k: v for k, v in baseline_entry.items() if k != "result"}
+    record["baseline_result"] = baseline_entry["result"]
+    record["candidate_result"] = candidate_entry["result"]
+    return record
+
+
+def compare(
+    rules: dict[str, Any] | None,
+    baseline_facts: dict[str, Any] | None,
+    candidate_facts: dict[str, Any] | None,
+    target: Any,
+) -> dict[str, Any]:
+    """Evaluate ``target`` against two fact sets and diff the two outcomes.
+
+    Static analysis must have passed (see :func:`analyze`). Both sides go
+    through :func:`evaluate` with the same rules and target, so
+    short-circuiting, reference resolution and output ordering are exactly
+    those of a single evaluation.
+    """
+    baseline = evaluate(rules, baseline_facts, target)
+    candidate = evaluate(rules, candidate_facts, target)
+
+    # Paths are unique within one evaluation (each node is visited at most
+    # once), so hit_paths can be aligned by path on both sides.
+    base_by_path = {entry["path"]: entry for entry in baseline["hit_paths"]}
+    cand_by_path = {entry["path"]: entry for entry in candidate["hit_paths"]}
+
+    added = [e for e in candidate["hit_paths"] if e["path"] not in base_by_path]
+    removed = [e for e in baseline["hit_paths"] if e["path"] not in cand_by_path]
+    changed = [
+        _result_change(entry, cand_by_path[entry["path"]])
+        for entry in baseline["hit_paths"]
+        if entry["path"] in cand_by_path
+        and entry["result"] != cand_by_path[entry["path"]]["result"]
+    ]
+
+    base_used = set(baseline["used_facts"])
+    cand_used = set(candidate["used_facts"])
+    base_missing = set(baseline["missing_fields"])
+    cand_missing = set(candidate["missing_fields"])
+
+    return {
+        "baseline": baseline,
+        "candidate": candidate,
+        "result_changed": baseline["result"] != candidate["result"],
+        "hit_paths_added": added,
+        "hit_paths_removed": removed,
+        "hit_paths_result_changed": changed,
+        "used_facts_added": sorted(cand_used - base_used),
+        "used_facts_removed": sorted(base_used - cand_used),
+        "missing_fields_added": sorted(cand_missing - base_missing),
+        "missing_fields_removed": sorted(base_missing - cand_missing),
+    }
